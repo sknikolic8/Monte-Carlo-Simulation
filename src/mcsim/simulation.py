@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+import miepython
 import numpy as np
 from numpy.random import Generator
 from tqdm import tqdm
@@ -16,7 +17,8 @@ from .tissue import TissueLayer
 
 _WEIGHT_THRESHOLD = 1e-4
 _ROULETTE_SURVIVE = 0.1
-_ON_AXIS_TOL = 1.0 - 1e-12
+_MIE_ANGLE_BINS = 721  # 0.25 deg resolution over cos(theta) in [-1, 1]
+_N_POLARIZATION_BINS = 45  # exit-angle bins spanning 0-90 deg
 
 
 @dataclass
@@ -28,6 +30,8 @@ class SimulationResult:
     specular_r: float
     z_bins: np.ndarray
     absorbed_profile: np.ndarray
+    exit_angle_bins: np.ndarray
+    dolp_profile: np.ndarray
 
     def check_energy_conservation(self, tol: float = 1e-3) -> bool:
         total = self.reflectance + self.transmittance + self.absorbed + self.specular_r
@@ -39,11 +43,14 @@ class Simulation:
 
     Parameters
     ----------
-    layer   : TissueLayer describing the medium.
-    n_above : refractive index of the medium above the slab (default air=1.0).
-    n_below : refractive index of the medium below the slab (default air=1.0).
-    n_bins  : number of depth bins for the absorbed-energy profile.
-    seed    : RNG seed for reproducibility.
+    layer           : TissueLayer describing the medium.
+    n_above         : refractive index of the medium above the slab (default air=1.0).
+    n_below         : refractive index of the medium below the slab (default air=1.0).
+    n_bins          : number of depth bins for the absorbed-energy profile.
+    seed            : RNG seed for reproducibility.
+    initial_stokes  : Stokes vector [I, Q, U, V] of the incident photons, defined
+                      in the (x, y) lab frame perpendicular to the beam. Defaults
+                      to unpolarised light.
     """
 
     def __init__(
@@ -53,16 +60,45 @@ class Simulation:
         n_below: float = 1.0,
         n_bins: int = 200,
         seed: int | None = 42,
+        initial_stokes: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
     ) -> None:
         self.layer = layer
         self.n_above = n_above
         self.n_below = n_below
         self.n_bins = n_bins
         self.rng: Generator = np.random.default_rng(seed)
+        self.initial_stokes = tuple(float(v) for v in initial_stokes)
 
         # Depth binning over the slab (or 10 mm for semi-infinite)
         depth = layer.depth if math.isfinite(layer.depth) else 10.0
         self.z_bins = np.linspace(0.0, depth, n_bins + 1)
+
+        # Exit-angle binning (degrees from the surface normal) for the
+        # degree-of-linear-polarization profile.
+        self.n_pol_bins = _N_POLARIZATION_BINS
+        self.exit_angle_bins = np.linspace(0.0, 90.0, self.n_pol_bins + 1)
+
+        # Precompute the Mie scattering (Mueller) matrix on a fine grid of
+        # scattering angles, so each scattering event can look up the matrix
+        # for the same deflection angle it samples from the Henyey-Greenstein
+        # phase function, without re-running the Mie series every event.
+        # Stored as plain Python tuples (rather than indexing a numpy array
+        # per event) since this lookup sits in the hot per-scatter-event loop.
+        mu_grid = np.linspace(-1.0, 1.0, _MIE_ANGLE_BINS)
+        grid = miepython.phase_matrix(
+            complex(layer.mie_relative_index, 0.0),
+            layer.mie_size_parameter,
+            mu_grid,
+        )  # shape (4, 4, _MIE_ANGLE_BINS)
+        self._mueller_grid: list[tuple[float, ...]] = [
+            tuple(grid[:, :, i].reshape(-1)) for i in range(_MIE_ANGLE_BINS)
+        ]
+
+    def _mueller_matrix(self, cos_theta: float) -> tuple[float, ...]:
+        """Look up the precomputed (flattened, row-major) Mueller matrix for a scattering angle."""
+        idx = int(round((cos_theta + 1.0) * 0.5 * (_MIE_ANGLE_BINS - 1)))
+        idx = min(max(idx, 0), _MIE_ANGLE_BINS - 1)
+        return self._mueller_grid[idx]
 
     # ------------------------------------------------------------------
     # Public interface
@@ -79,12 +115,29 @@ class Simulation:
         total_a = 0.0      # absorbed weight accumulator
         abs_profile = np.zeros(self.n_bins)
 
+        # Weighted Stokes-vector sums per exit-angle bin, used to compute the
+        # ensemble degree of linear polarization as a function of exit angle.
+        pol_i = np.zeros(self.n_pol_bins)
+        pol_q = np.zeros(self.n_pol_bins)
+        pol_u = np.zeros(self.n_pol_bins)
+
         for _ in tqdm(range(n_photons), desc="Photons", unit="photon"):
-            dr, dt, da, prof = self._trace_photon(r_specular)
+            dr, dt, da, prof, exit_angle, exit_stokes, exit_weight = self._trace_photon(r_specular)
             total_r += dr
             total_t += dt
             total_a += da
             abs_profile += prof
+            if exit_angle is not None:
+                bin_idx = min(int(exit_angle / 90.0 * self.n_pol_bins), self.n_pol_bins - 1)
+                pol_i[bin_idx] += exit_weight * exit_stokes[0]
+                pol_q[bin_idx] += exit_weight * exit_stokes[1]
+                pol_u[bin_idx] += exit_weight * exit_stokes[2]
+
+        dolp_profile = np.zeros(self.n_pol_bins)
+        has_signal = pol_i > 0
+        dolp_profile[has_signal] = (
+            np.sqrt(pol_q[has_signal] ** 2 + pol_u[has_signal] ** 2) / pol_i[has_signal]
+        )
 
         scale = 1.0 / n_photons
         return SimulationResult(
@@ -95,6 +148,8 @@ class Simulation:
             specular_r=r_specular,
             z_bins=self.z_bins,
             absorbed_profile=abs_profile * scale,
+            exit_angle_bins=self.exit_angle_bins,
+            dolp_profile=dolp_profile,
         )
 
     # ------------------------------------------------------------------
@@ -103,18 +158,29 @@ class Simulation:
 
     def _trace_photon(
         self, r_specular: float
-    ) -> tuple[float, float, float, np.ndarray]:
+    ) -> tuple[float, float, float, np.ndarray, float | None, tuple[float, ...] | None, float]:
         layer = self.layer
         rng = self.rng
 
-        # Photon state
+        # Photon state: position, propagation direction (ux, uy, uz), and the
+        # local polarization reference frame (frame_par, frame_perp), which
+        # together with the direction forms a right-handed orthonormal
+        # triad. The Stokes vector is always expressed in this local frame.
+        # Plain tuples/floats (rather than numpy arrays) are used here since
+        # this is the hot per-scatter-event loop.
         x, y, z = 0.0, 0.0, 0.0
-        ux, uy, uz = 0.0, 0.0, 1.0          # direction cosines
+        u = (0.0, 0.0, 1.0)
+        frame_par = (1.0, 0.0, 0.0)
+        frame_perp = (0.0, 1.0, 0.0)
+        stokes = self.initial_stokes
         weight = 1.0 - r_specular            # subtract specular at entry
 
         total_r = 0.0
         total_t = 0.0
         abs_profile = np.zeros(self.n_bins)
+        exit_angle: float | None = None
+        exit_stokes: tuple[float, ...] | None = None
+        exit_weight = 0.0
 
         while weight > 0.0:
             # --- Step ---
@@ -124,9 +190,11 @@ class Simulation:
                 xi = 1e-300
             step = -math.log(xi) / layer.mu_t
 
+            uz = u[2]
+
             # Move photon
-            x_new = x + ux * step
-            y_new = y + uy * step
+            x_new = x + u[0] * step
+            y_new = y + u[1] * step
             z_new = z + uz * step
 
             # --- Boundary check ---
@@ -135,14 +203,20 @@ class Simulation:
                 t_frac = -z / (uz * step)         # fraction of step to boundary
                 z_cross = 0.0
                 if _internal_reflection(layer.n, self.n_above, uz, rng):
-                    # Reflect: reverse z-component, stay inside
+                    # Reflect: mirror the z-component of direction and frame,
+                    # keeping (u, frame_par, frame_perp) orthonormal.
                     z = z_cross
-                    x += ux * step * t_frac
-                    y += uy * step * t_frac
-                    uz = -uz
+                    x += u[0] * step * t_frac
+                    y += u[1] * step * t_frac
+                    u = (u[0], u[1], -u[2])
+                    frame_par = (frame_par[0], frame_par[1], -frame_par[2])
+                    frame_perp = (frame_perp[0], frame_perp[1], -frame_perp[2])
                     continue
                 else:
                     total_r += weight
+                    exit_angle = math.degrees(math.acos(min(1.0, abs(uz))))
+                    exit_stokes = stokes
+                    exit_weight = weight
                     break
 
             elif z_new > layer.depth:
@@ -150,12 +224,17 @@ class Simulation:
                 if _internal_reflection(layer.n, self.n_below, uz, rng):
                     t_frac = (layer.depth - z) / (uz * step)
                     z = layer.depth
-                    x += ux * step * t_frac
-                    y += uy * step * t_frac
-                    uz = -uz
+                    x += u[0] * step * t_frac
+                    y += u[1] * step * t_frac
+                    u = (u[0], u[1], -u[2])
+                    frame_par = (frame_par[0], frame_par[1], -frame_par[2])
+                    frame_perp = (frame_perp[0], frame_perp[1], -frame_perp[2])
                     continue
                 else:
                     total_t += weight
+                    exit_angle = math.degrees(math.acos(min(1.0, abs(uz))))
+                    exit_stokes = stokes
+                    exit_weight = weight
                     break
 
             x, y, z = x_new, y_new, z_new
@@ -177,10 +256,21 @@ class Simulation:
                     break
 
             # --- Scatter ---
-            ux, uy, uz = _henyey_greenstein_scatter(ux, uy, uz, layer.g, rng)
+            # Sample the same deflection angle used for both the photon's
+            # new direction and the Mueller-matrix lookup, and a fresh
+            # azimuth about the current direction.
+            cos_theta = _sample_hg_cos_theta(layer.g, rng)
+            phi = 2.0 * math.pi * rng.random()
+
+            u, frame_par, frame_perp = _rotate_frame(u, frame_par, frame_perp, cos_theta, phi)
+            stokes = _rotate_stokes(stokes, phi)
+            stokes = _apply_mueller(self._mueller_matrix(cos_theta), stokes)
+            if stokes[0] > 0.0:
+                inv_i = 1.0 / stokes[0]
+                stokes = (stokes[0] * inv_i, stokes[1] * inv_i, stokes[2] * inv_i, stokes[3] * inv_i)
 
         total_a = abs_profile.sum()
-        return total_r, total_t, total_a, abs_profile
+        return total_r, total_t, total_a, abs_profile, exit_angle, exit_stokes, exit_weight
 
 
 # ------------------------------------------------------------------
@@ -227,38 +317,85 @@ def _internal_reflection(n_i: float, n_t: float, uz: float, rng: Generator) -> b
     return rng.random() < r_fres
 
 
-def _henyey_greenstein_scatter(
-    ux: float, uy: float, uz: float, g: float, rng: Generator
-) -> tuple[float, float, float]:
-    """Update direction cosines using Henyey-Greenstein phase function."""
+def _sample_hg_cos_theta(g: float, rng: Generator) -> float:
+    """Sample the scattering deflection angle from the Henyey-Greenstein phase function."""
     xi1 = rng.random()
-    xi2 = rng.random()
-
-    # Deflection angle cos(theta)
     if abs(g) < 1e-10:
         cos_theta = 2.0 * xi1 - 1.0
     else:
         tmp = (1.0 - g * g) / (1.0 - g + 2.0 * g * xi1)
         cos_theta = (1.0 + g * g - tmp * tmp) / (2.0 * g)
         cos_theta = max(-1.0, min(1.0, cos_theta))
+    return cos_theta
 
+
+Vec3 = tuple[float, float, float]
+
+
+def _rotate_frame(
+    u: Vec3,
+    frame_par: Vec3,
+    frame_perp: Vec3,
+    cos_theta: float,
+    phi: float,
+) -> tuple[Vec3, Vec3, Vec3]:
+    """Deflect the propagation direction and update the local reference frame.
+
+    ``frame_par``/``frame_perp`` are unit vectors perpendicular to ``u`` such
+    that (u, frame_par, frame_perp) is a right-handed orthonormal triad. The
+    photon is first rotated in azimuth by ``phi`` about ``u`` (bringing
+    ``frame_par`` into the new scattering plane), then deflected by the polar
+    angle ``theta`` within that plane. This mirrors the rotation applied to
+    the photon's Stokes vector by ``_rotate_stokes`` and the Mueller matrix,
+    so the direction update and the polarization update always use the same
+    (theta, phi) pair.
+    """
     sin_theta = math.sqrt(max(0.0, 1.0 - cos_theta**2))
-    phi = 2.0 * math.pi * xi2
     cos_phi = math.cos(phi)
     sin_phi = math.sin(phi)
 
-    # Direction cosine update (special case when beam is nearly on-axis)
-    if abs(uz) > _ON_AXIS_TOL:
-        sign_z = 1.0 if uz > 0 else -1.0
-        ux_new = sin_theta * cos_phi
-        uy_new = sin_theta * sin_phi
-        uz_new = sign_z * cos_theta
-    else:
-        denom = math.sqrt(1.0 - uz**2)
-        ux_new = sin_theta * (ux * uz * cos_phi - uy * sin_phi) / denom + ux * cos_theta
-        uy_new = sin_theta * (uy * uz * cos_phi + ux * sin_phi) / denom + uy * cos_theta
-        uz_new = -sin_theta * cos_phi * denom + uz * cos_theta
+    par_rx = cos_phi * frame_par[0] + sin_phi * frame_perp[0]
+    par_ry = cos_phi * frame_par[1] + sin_phi * frame_perp[1]
+    par_rz = cos_phi * frame_par[2] + sin_phi * frame_perp[2]
 
-    # Normalise to guard against floating-point drift
-    norm = math.sqrt(ux_new**2 + uy_new**2 + uz_new**2)
-    return ux_new / norm, uy_new / norm, uz_new / norm
+    perp_new = (
+        -sin_phi * frame_par[0] + cos_phi * frame_perp[0],
+        -sin_phi * frame_par[1] + cos_phi * frame_perp[1],
+        -sin_phi * frame_par[2] + cos_phi * frame_perp[2],
+    )
+
+    ux = cos_theta * u[0] + sin_theta * par_rx
+    uy = cos_theta * u[1] + sin_theta * par_ry
+    uz = cos_theta * u[2] + sin_theta * par_rz
+    u_norm = math.sqrt(ux * ux + uy * uy + uz * uz)
+    u_new = (ux / u_norm, uy / u_norm, uz / u_norm)
+
+    pux = cos_theta * par_rx - sin_theta * u[0]
+    puy = cos_theta * par_ry - sin_theta * u[1]
+    puz = cos_theta * par_rz - sin_theta * u[2]
+    p_norm = math.sqrt(pux * pux + puy * puy + puz * puz)
+    par_new = (pux / p_norm, puy / p_norm, puz / p_norm)
+
+    return u_new, par_new, perp_new
+
+
+def _rotate_stokes(stokes: tuple[float, float, float, float], phi: float) -> tuple[float, float, float, float]:
+    """Rotate a Stokes vector's reference frame by azimuth ``phi`` about the propagation axis."""
+    cos_2phi = math.cos(2.0 * phi)
+    sin_2phi = math.sin(2.0 * phi)
+    i, q, u, v = stokes
+    return (i, cos_2phi * q + sin_2phi * u, -sin_2phi * q + cos_2phi * u, v)
+
+
+def _apply_mueller(
+    matrix: tuple[float, ...], stokes: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Apply a 4x4 Mueller matrix (flattened, row-major) to a Stokes vector."""
+    m = matrix
+    i, q, u, v = stokes
+    return (
+        m[0] * i + m[1] * q + m[2] * u + m[3] * v,
+        m[4] * i + m[5] * q + m[6] * u + m[7] * v,
+        m[8] * i + m[9] * q + m[10] * u + m[11] * v,
+        m[12] * i + m[13] * q + m[14] * u + m[15] * v,
+    )

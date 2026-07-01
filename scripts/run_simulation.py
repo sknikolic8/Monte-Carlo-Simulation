@@ -12,9 +12,13 @@ layer = TissueLayer(
     g=0.9,       #       anisotropy
     n=1.4,       #       refractive index
     depth=10.0,  # mm    slab thickness
+    sphere_diameter=1.0,  # um    Mie scatterer diameter
+    sphere_index=1.46,    #       Mie scatterer refractive index
+    wavelength=0.633,     # um    illumination wavelength
 )
 
-sim = Simulation(layer, n_above=1.0, n_below=1.0, seed=42)
+# Unpolarised incident light: Stokes vector [I, Q, U, V] = [1, 0, 0, 0]
+sim = Simulation(layer, n_above=1.0, n_below=1.0, seed=42, initial_stokes=(1.0, 0.0, 0.0, 0.0))
 result = sim.run(n_photons=50_000)
 
 print(f"Specular R    : {result.specular_r:.4f}")
@@ -40,3 +44,21 @@ fig.tight_layout()
 plt.savefig("absorbed_profile.png", dpi=150)
 plt.show()
 print("Plot saved to absorbed_profile.png")
+
+# --- Degree of linear polarization vs exit angle ---
+angle_centers = 0.5 * (result.exit_angle_bins[:-1] + result.exit_angle_bins[1:])
+
+fig2, ax2 = plt.subplots(figsize=(7, 4))
+ax2.plot(angle_centers, result.dolp_profile, lw=1.5, marker="o", ms=3)
+ax2.set_xlabel("Exit angle from surface normal (deg)")
+ax2.set_ylabel("Degree of linear polarization")
+ax2.set_title(
+    f"Exit polarization — sphere d={layer.sphere_diameter}um, "
+    f"n_sphere={layer.sphere_index}, λ={layer.wavelength}um"
+)
+ax2.set_xlim(0, 90)
+ax2.set_ylim(bottom=0)
+fig2.tight_layout()
+plt.savefig("polarization_vs_exit_angle.png", dpi=150)
+plt.show()
+print("Plot saved to polarization_vs_exit_angle.png")
