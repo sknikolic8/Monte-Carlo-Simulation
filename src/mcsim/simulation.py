@@ -1,4 +1,10 @@
-"""Monte Carlo photon transport simulation (MCML-style).
+"""Monte Carlo photon transport simulation (MCML-style), vectorized with torch.
+
+All photons in a batch are traced simultaneously as torch tensors (one row per
+photon) so the simulation can run on a GPU; each iteration of the loop below
+advances every still-alive photon by one scattering event (or one boundary
+interaction) at once, using boolean masks in place of the branches an
+unbatched, per-photon implementation would use.
 
 Reference: Wang, Jacques & Zheng, Comp Meth Prog Biomed 47 (1995) 131-146.
 """
@@ -6,17 +12,34 @@ Reference: Wang, Jacques & Zheng, Comp Meth Prog Biomed 47 (1995) 131-146.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass
 
+import miepython
 import numpy as np
-from numpy.random import Generator
+import torch
 from tqdm import tqdm
 
 from .tissue import TissueLayer
 
 _WEIGHT_THRESHOLD = 1e-4
 _ROULETTE_SURVIVE = 0.1
-_ON_AXIS_TOL = 1.0 - 1e-12
+_MIE_ANGLE_BINS = 721  # 0.25 deg resolution over cos(theta) in [-1, 1]
+_N_POLARIZATION_BINS = 45  # exit-angle bins spanning 0-90 deg
+_DTYPE = torch.float64
+
+
+def _select_device(preferred: str | None) -> torch.device:
+    """Pick a torch device: the requested one, else GPU if available, else CPU."""
+    if preferred is not None:
+        return torch.device(preferred)
+    if torch.cuda.is_available():
+        try:
+            torch.zeros(1, device="cuda")
+            return torch.device("cuda")
+        except Exception:
+            return torch.device("cpu")
+    return torch.device("cpu")
 
 
 @dataclass
@@ -28,6 +51,8 @@ class SimulationResult:
     specular_r: float
     z_bins: np.ndarray
     absorbed_profile: np.ndarray
+    exit_angle_bins: np.ndarray
+    dolp_profile: np.ndarray
 
     def check_energy_conservation(self, tol: float = 1e-3) -> bool:
         total = self.reflectance + self.transmittance + self.absorbed + self.specular_r
@@ -35,15 +60,22 @@ class SimulationResult:
 
 
 class Simulation:
-    """Run a Monte Carlo simulation for a single homogeneous tissue slab.
+    """Run a batched Monte Carlo simulation for a single homogeneous tissue slab.
 
     Parameters
     ----------
-    layer   : TissueLayer describing the medium.
-    n_above : refractive index of the medium above the slab (default air=1.0).
-    n_below : refractive index of the medium below the slab (default air=1.0).
-    n_bins  : number of depth bins for the absorbed-energy profile.
-    seed    : RNG seed for reproducibility.
+    layer           : TissueLayer describing the medium.
+    n_above         : refractive index of the medium above the slab (default air=1.0).
+    n_below         : refractive index of the medium below the slab (default air=1.0).
+    n_bins          : number of depth bins for the absorbed-energy profile.
+    seed            : RNG seed for reproducibility.
+    initial_stokes  : Stokes vector [I, Q, U, V] of the incident photons, defined
+                      in the (x, y) lab frame perpendicular to the beam. Defaults
+                      to unpolarised light.
+    device          : torch device to run on ("cuda", "cpu", ...). Defaults to
+                      GPU when available, otherwise CPU. If running on the
+                      selected device raises an error, ``run`` automatically
+                      retries on CPU.
     """
 
     def __init__(
@@ -53,134 +85,225 @@ class Simulation:
         n_below: float = 1.0,
         n_bins: int = 200,
         seed: int | None = 42,
+        initial_stokes: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0),
+        device: str | None = None,
     ) -> None:
         self.layer = layer
         self.n_above = n_above
         self.n_below = n_below
         self.n_bins = n_bins
-        self.rng: Generator = np.random.default_rng(seed)
+        self.seed = seed
+        self.initial_stokes = tuple(float(v) for v in initial_stokes)
+        self.device = _select_device(device)
 
         # Depth binning over the slab (or 10 mm for semi-infinite)
-        depth = layer.depth if math.isfinite(layer.depth) else 10.0
-        self.z_bins = np.linspace(0.0, depth, n_bins + 1)
+        self._bin_depth = layer.depth if math.isfinite(layer.depth) else 10.0
+        self.z_bins = np.linspace(0.0, self._bin_depth, n_bins + 1)
+
+        # Exit-angle binning (degrees from the surface normal) for the
+        # degree-of-linear-polarization profile.
+        self.n_pol_bins = _N_POLARIZATION_BINS
+        self.exit_angle_bins = np.linspace(0.0, 90.0, self.n_pol_bins + 1)
+
+        # Precompute the Mie scattering (Mueller) matrix on a fine grid of
+        # scattering angles, so each scattering event can look up the matrix
+        # for the same deflection angle it samples from the Henyey-Greenstein
+        # phase function, without re-running the Mie series every event.
+        mu_grid = np.linspace(-1.0, 1.0, _MIE_ANGLE_BINS)
+        grid = miepython.phase_matrix(
+            complex(layer.mie_relative_index, 0.0),
+            layer.mie_size_parameter,
+            mu_grid,
+        )  # shape (4, 4, _MIE_ANGLE_BINS)
+        self._mueller_grid_np = np.ascontiguousarray(np.moveaxis(grid, 2, 0))  # (_MIE_ANGLE_BINS, 4, 4)
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def run(self, n_photons: int) -> SimulationResult:
-        layer = self.layer
-
-        # Specular reflectance at the top surface (normal incidence)
-        r_specular = _fresnel_specular(self.n_above, layer.n)
-
-        total_r = 0.0      # diffuse reflectance accumulator
-        total_t = 0.0      # transmittance accumulator
-        total_a = 0.0      # absorbed weight accumulator
-        abs_profile = np.zeros(self.n_bins)
-
-        for _ in tqdm(range(n_photons), desc="Photons", unit="photon"):
-            dr, dt, da, prof = self._trace_photon(r_specular)
-            total_r += dr
-            total_t += dt
-            total_a += da
-            abs_profile += prof
-
-        scale = 1.0 / n_photons
-        return SimulationResult(
-            n_photons=n_photons,
-            reflectance=total_r * scale,
-            transmittance=total_t * scale,
-            absorbed=total_a * scale,
-            specular_r=r_specular,
-            z_bins=self.z_bins,
-            absorbed_profile=abs_profile * scale,
-        )
+        """Run the simulation, preferring ``self.device`` and falling back to CPU on error."""
+        try:
+            return self._run_on_device(n_photons, self.device)
+        except Exception as exc:
+            if self.device.type == "cpu":
+                raise
+            warnings.warn(f"Simulation on {self.device} failed ({exc!r}); falling back to CPU.")
+            return self._run_on_device(n_photons, torch.device("cpu"))
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _trace_photon(
-        self, r_specular: float
-    ) -> tuple[float, float, float, np.ndarray]:
+    def _run_on_device(self, n_photons: int, device: torch.device) -> SimulationResult:
         layer = self.layer
-        rng = self.rng
+        n = n_photons
 
-        # Photon state
-        x, y, z = 0.0, 0.0, 0.0
-        ux, uy, uz = 0.0, 0.0, 1.0          # direction cosines
-        weight = 1.0 - r_specular            # subtract specular at entry
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self.seed if self.seed is not None else torch.seed())
 
-        total_r = 0.0
-        total_t = 0.0
-        abs_profile = np.zeros(self.n_bins)
+        def rand(*shape: int) -> torch.Tensor:
+            return torch.rand(*shape, generator=gen, device=device, dtype=_DTYPE)
 
-        while weight > 0.0:
+        mueller_grid = torch.as_tensor(self._mueller_grid_np, dtype=_DTYPE, device=device)
+
+        r_specular = _fresnel_specular(self.n_above, layer.n)
+        mu_t = layer.mu_t
+        mu_a = layer.mu_a
+        g = layer.g
+        layer_depth = layer.depth  # may be math.inf for a semi-infinite slab
+        bin_depth = self._bin_depth
+        n_bins = self.n_bins
+        n_pol_bins = self.n_pol_bins
+
+        # Photon state, one row per photon. (u, frame_par, frame_perp) form a
+        # right-handed orthonormal triad; the Stokes vector is expressed in it.
+        pos = torch.zeros((n, 3), dtype=_DTYPE, device=device)
+        direction = torch.zeros((n, 3), dtype=_DTYPE, device=device)
+        direction[:, 2] = 1.0
+        frame_par = torch.zeros((n, 3), dtype=_DTYPE, device=device)
+        frame_par[:, 0] = 1.0
+        frame_perp = torch.zeros((n, 3), dtype=_DTYPE, device=device)
+        frame_perp[:, 1] = 1.0
+        stokes = torch.tensor(self.initial_stokes, dtype=_DTYPE, device=device).expand(n, 4).clone()
+        weight = torch.full((n,), 1.0 - r_specular, dtype=_DTYPE, device=device)
+        alive = torch.ones(n, dtype=torch.bool, device=device)
+
+        total_r = torch.zeros((), dtype=_DTYPE, device=device)
+        total_t = torch.zeros((), dtype=_DTYPE, device=device)
+        abs_profile = torch.zeros(n_bins, dtype=_DTYPE, device=device)
+        pol_i = torch.zeros(n_pol_bins, dtype=_DTYPE, device=device)
+        pol_q = torch.zeros(n_pol_bins, dtype=_DTYPE, device=device)
+        pol_u = torch.zeros(n_pol_bins, dtype=_DTYPE, device=device)
+
+        progress = tqdm(total=n, desc="Photons", unit="photon")
+        n_alive_prev = n
+
+        while bool(alive.any()):
             # --- Step ---
-            xi = rng.random()
-            # avoid log(0) — xi=0 is vanishingly rare but possible
-            if xi == 0.0:
-                xi = 1e-300
-            step = -math.log(xi) / layer.mu_t
+            xi = rand(n).clamp_min(1e-300)
+            step = -torch.log(xi) / mu_t
 
-            # Move photon
-            x_new = x + ux * step
-            y_new = y + uy * step
-            z_new = z + uz * step
+            uz = direction[:, 2]
+            x_new = pos[:, 0] + direction[:, 0] * step
+            y_new = pos[:, 1] + direction[:, 1] * step
+            z_new = pos[:, 2] + uz * step
 
-            # --- Boundary check ---
-            if z_new < 0.0:
-                # Photon hit top surface; check internal reflection
-                t_frac = -z / (uz * step)         # fraction of step to boundary
-                z_cross = 0.0
-                if _internal_reflection(layer.n, self.n_above, uz, rng):
-                    # Reflect: reverse z-component, stay inside
-                    z = z_cross
-                    x += ux * step * t_frac
-                    y += uy * step * t_frac
-                    uz = -uz
-                    continue
-                else:
-                    total_r += weight
-                    break
+            # --- Boundary classification ---
+            crossing_top = alive & (z_new < 0.0)
+            crossing_bottom = alive & (z_new > layer_depth)
+            no_cross = alive & ~crossing_top & ~crossing_bottom
 
-            elif z_new > layer.depth:
-                # Photon hit bottom surface
-                if _internal_reflection(layer.n, self.n_below, uz, rng):
-                    t_frac = (layer.depth - z) / (uz * step)
-                    z = layer.depth
-                    x += ux * step * t_frac
-                    y += uy * step * t_frac
-                    uz = -uz
-                    continue
-                else:
-                    total_t += weight
-                    break
+            cos_i = uz.abs()
+            r_top = _fresnel_reflectance(layer.n, self.n_above, cos_i)
+            r_bottom = _fresnel_reflectance(layer.n, self.n_below, cos_i)
+            reflect_top = crossing_top & (rand(n) < r_top)
+            reflect_bottom = crossing_bottom & (rand(n) < r_bottom)
+            reflect_mask = reflect_top | reflect_bottom
+            exit_top = crossing_top & ~reflect_top
+            exit_bottom = crossing_bottom & ~reflect_bottom
+            exit_mask = exit_top | exit_bottom
 
-            x, y, z = x_new, y_new, z_new
+            # --- Reflection geometry: land exactly on the crossed boundary ---
+            t_frac_top = -pos[:, 2] / (uz * step)
+            t_frac_bottom = (layer_depth - pos[:, 2]) / (uz * step)
+            t_frac = torch.where(crossing_top, t_frac_top, t_frac_bottom)
+            z_boundary = torch.where(crossing_top, torch.zeros_like(pos[:, 2]), torch.full_like(pos[:, 2], bin_depth))
+            refl_x = pos[:, 0] + direction[:, 0] * step * t_frac
+            refl_y = pos[:, 1] + direction[:, 1] * step * t_frac
 
-            # --- Absorption ---
-            delta_w = weight * (layer.mu_a / layer.mu_t)
-            weight -= delta_w
+            # --- Exiting photons: accumulate R/T and polarization-vs-angle bins ---
+            exit_angle_deg = torch.rad2deg(torch.acos(cos_i.clamp(max=1.0)))
+            bin_idx_pol = (exit_angle_deg / 90.0 * n_pol_bins).long().clamp(0, n_pol_bins - 1)
 
-            # Deposit into depth profile
-            bin_idx = int(z / layer.depth * self.n_bins) if math.isfinite(layer.depth) else int(z / 10.0 * self.n_bins)
-            bin_idx = min(bin_idx, self.n_bins - 1)
-            abs_profile[bin_idx] += delta_w
+            total_r = total_r + weight[exit_top].sum()
+            total_t = total_t + weight[exit_bottom].sum()
+            if exit_mask.any():
+                idx_sel = bin_idx_pol[exit_mask]
+                w_sel = weight[exit_mask]
+                s_sel = stokes[exit_mask]
+                pol_i.index_add_(0, idx_sel, w_sel * s_sel[:, 0])
+                pol_q.index_add_(0, idx_sel, w_sel * s_sel[:, 1])
+                pol_u.index_add_(0, idx_sel, w_sel * s_sel[:, 2])
+
+            # --- Absorption (only for photons that stayed inside this step) ---
+            delta_w = weight * (mu_a / mu_t)
+            weight_after_abs = torch.where(no_cross, weight - delta_w, weight)
+            if no_cross.any():
+                bin_idx_abs = (z_new / bin_depth * n_bins).long().clamp(0, n_bins - 1)
+                abs_profile.index_add_(0, bin_idx_abs[no_cross], delta_w[no_cross])
 
             # --- Russian roulette ---
-            if weight < _WEIGHT_THRESHOLD:
-                if rng.random() < _ROULETTE_SURVIVE:
-                    weight /= _ROULETTE_SURVIVE
-                else:
-                    break
+            below_threshold = no_cross & (weight_after_abs < _WEIGHT_THRESHOLD)
+            survive = below_threshold & (rand(n) < _ROULETTE_SURVIVE)
+            died = below_threshold & ~survive
+            weight_after_roulette = torch.where(survive, weight_after_abs / _ROULETTE_SURVIVE, weight_after_abs)
 
-            # --- Scatter ---
-            ux, uy, uz = _henyey_greenstein_scatter(ux, uy, uz, layer.g, rng)
+            # --- Scatter: sample the same (theta, phi) for direction and Mueller lookup ---
+            scatter_mask = no_cross & ~died
+            xi_hg = rand(n)
+            if abs(g) < 1e-10:
+                cos_theta = 2.0 * xi_hg - 1.0
+            else:
+                tmp = (1.0 - g * g) / (1.0 - g + 2.0 * g * xi_hg)
+                cos_theta = (1.0 + g * g - tmp * tmp) / (2.0 * g)
+                cos_theta = cos_theta.clamp(-1.0, 1.0)
+            phi = 2.0 * math.pi * rand(n)
 
-        total_a = abs_profile.sum()
-        return total_r, total_t, total_a, abs_profile
+            new_dir, new_par, new_perp = _rotate_frame_batch(direction, frame_par, frame_perp, cos_theta, phi)
+            rotated_stokes = _rotate_stokes_batch(stokes, phi)
+            idx_mie = ((cos_theta + 1.0) * 0.5 * (_MIE_ANGLE_BINS - 1)).round().long().clamp(0, _MIE_ANGLE_BINS - 1)
+            matrices = mueller_grid[idx_mie]  # (n, 4, 4)
+            scattered_stokes = torch.bmm(matrices, rotated_stokes.unsqueeze(-1)).squeeze(-1)
+            new_i = scattered_stokes[:, 0]
+            safe = (new_i > 0.0).unsqueeze(-1)
+            scattered_stokes = torch.where(safe, scattered_stokes / new_i.clamp_min(1e-300).unsqueeze(-1), scattered_stokes)
+
+            # --- Combine branches into the next state ---
+            mirror = torch.tensor([1.0, 1.0, -1.0], dtype=_DTYPE, device=device)
+            pos = torch.stack(
+                [
+                    torch.where(reflect_mask, refl_x, torch.where(no_cross, x_new, pos[:, 0])),
+                    torch.where(reflect_mask, refl_y, torch.where(no_cross, y_new, pos[:, 1])),
+                    torch.where(reflect_mask, z_boundary, torch.where(no_cross, z_new, pos[:, 2])),
+                ],
+                dim=1,
+            )
+            reflect_col = reflect_mask.unsqueeze(-1)
+            scatter_col = scatter_mask.unsqueeze(-1)
+            direction = torch.where(reflect_col, direction * mirror, direction)
+            direction = torch.where(scatter_col, new_dir, direction)
+            frame_par = torch.where(reflect_col, frame_par * mirror, frame_par)
+            frame_par = torch.where(scatter_col, new_par, frame_par)
+            frame_perp = torch.where(reflect_col, frame_perp * mirror, frame_perp)
+            frame_perp = torch.where(scatter_col, new_perp, frame_perp)
+            stokes = torch.where(scatter_col, scattered_stokes, stokes)
+            weight = torch.where(no_cross, weight_after_roulette, weight)
+
+            alive = alive & ~exit_mask & ~died
+
+            n_alive = int(alive.sum().item())
+            progress.update(n_alive_prev - n_alive)
+            n_alive_prev = n_alive
+
+        progress.close()
+
+        dolp_profile = torch.zeros(n_pol_bins, dtype=_DTYPE, device=device)
+        has_signal = pol_i > 0
+        dolp_profile[has_signal] = torch.sqrt(pol_q[has_signal] ** 2 + pol_u[has_signal] ** 2) / pol_i[has_signal]
+
+        scale = 1.0 / n_photons
+        return SimulationResult(
+            n_photons=n_photons,
+            reflectance=total_r.item() * scale,
+            transmittance=total_t.item() * scale,
+            absorbed=abs_profile.sum().item() * scale,
+            specular_r=r_specular,
+            z_bins=self.z_bins,
+            absorbed_profile=abs_profile.cpu().numpy() * scale,
+            exit_angle_bins=self.exit_angle_bins,
+            dolp_profile=dolp_profile.cpu().numpy(),
+        )
 
 
 # ------------------------------------------------------------------
@@ -192,73 +315,68 @@ def _fresnel_specular(n_i: float, n_t: float) -> float:
     return ((n_i - n_t) / (n_i + n_t)) ** 2
 
 
-def _critical_angle_cos(n_i: float, n_t: float) -> float:
-    """cos(theta_c) for total internal reflection; 0 if n_t >= n_i."""
-    if n_t >= n_i:
-        return 0.0
-    return math.sqrt(1.0 - (n_t / n_i) ** 2)
+def _fresnel_reflectance(n_i: float, n_t: float, cos_i: torch.Tensor) -> torch.Tensor:
+    """Batched Fresnel reflectance probability (1.0 under total internal reflection)."""
+    cos_i = cos_i.clamp(0.0, 1.0)
+    sin_i2 = (1.0 - cos_i**2).clamp_min(0.0)
 
-
-def _internal_reflection(n_i: float, n_t: float, uz: float, rng: Generator) -> bool:
-    """Return True if the photon is internally reflected at a boundary.
-
-    Uses Fresnel reflectance for unpolarised light.  Photon travels in the
-    +z direction so uz > 0 for a bottom surface hit, uz < 0 for a top hit.
-    """
-    cos_i = abs(uz)
-
-    # Total internal reflection
     if n_t < n_i:
-        cos_c = _critical_angle_cos(n_i, n_t)
-        if cos_i < cos_c:
-            return True
+        cos_c2 = 1.0 - (n_t / n_i) ** 2
+        tir = cos_i**2 < cos_c2
+    else:
+        tir = torch.zeros_like(cos_i, dtype=torch.bool)
 
-    # Fresnel probabilistic reflection
-    sin_i = math.sqrt(max(0.0, 1.0 - cos_i**2))
-    sin_t = n_i * sin_i / n_t
-    if sin_t >= 1.0:
-        return True
-    cos_t = math.sqrt(max(0.0, 1.0 - sin_t**2))
+    sin_t = n_i * torch.sqrt(sin_i2) / n_t
+    beyond_critical = sin_t >= 1.0
+    cos_t = torch.sqrt((1.0 - sin_t.clamp(max=1.0 - 1e-12) ** 2).clamp_min(0.0))
 
     rs = ((n_i * cos_i - n_t * cos_t) / (n_i * cos_i + n_t * cos_t)) ** 2
     rp = ((n_t * cos_i - n_i * cos_t) / (n_t * cos_i + n_i * cos_t)) ** 2
-    r_fres = 0.5 * (rs + rp)
+    r_fresnel = 0.5 * (rs + rp)
 
-    return rng.random() < r_fres
+    return torch.where(tir | beyond_critical, torch.ones_like(cos_i), r_fresnel)
 
 
-def _henyey_greenstein_scatter(
-    ux: float, uy: float, uz: float, g: float, rng: Generator
-) -> tuple[float, float, float]:
-    """Update direction cosines using Henyey-Greenstein phase function."""
-    xi1 = rng.random()
-    xi2 = rng.random()
+def _rotate_frame_batch(
+    u: torch.Tensor,
+    frame_par: torch.Tensor,
+    frame_perp: torch.Tensor,
+    cos_theta: torch.Tensor,
+    phi: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched version of the single-photon frame/direction rotation.
 
-    # Deflection angle cos(theta)
-    if abs(g) < 1e-10:
-        cos_theta = 2.0 * xi1 - 1.0
-    else:
-        tmp = (1.0 - g * g) / (1.0 - g + 2.0 * g * xi1)
-        cos_theta = (1.0 + g * g - tmp * tmp) / (2.0 * g)
-        cos_theta = max(-1.0, min(1.0, cos_theta))
+    ``frame_par``/``frame_perp`` are unit vectors perpendicular to ``u`` such
+    that (u, frame_par, frame_perp) is a right-handed orthonormal triad. The
+    photon is first rotated in azimuth by ``phi`` about ``u`` (bringing
+    ``frame_par`` into the new scattering plane), then deflected by the polar
+    angle ``theta`` within that plane. This mirrors the rotation applied to
+    the photon's Stokes vector by ``_rotate_stokes_batch`` and the Mueller
+    matrix, so the direction update and the polarization update always use
+    the same (theta, phi) pair.
+    """
+    sin_theta = torch.sqrt((1.0 - cos_theta**2).clamp_min(0.0)).unsqueeze(-1)
+    cos_theta = cos_theta.unsqueeze(-1)
+    cos_phi = torch.cos(phi).unsqueeze(-1)
+    sin_phi = torch.sin(phi).unsqueeze(-1)
 
-    sin_theta = math.sqrt(max(0.0, 1.0 - cos_theta**2))
-    phi = 2.0 * math.pi * xi2
-    cos_phi = math.cos(phi)
-    sin_phi = math.sin(phi)
+    par_r = cos_phi * frame_par + sin_phi * frame_perp
+    perp_new = -sin_phi * frame_par + cos_phi * frame_perp
 
-    # Direction cosine update (special case when beam is nearly on-axis)
-    if abs(uz) > _ON_AXIS_TOL:
-        sign_z = 1.0 if uz > 0 else -1.0
-        ux_new = sin_theta * cos_phi
-        uy_new = sin_theta * sin_phi
-        uz_new = sign_z * cos_theta
-    else:
-        denom = math.sqrt(1.0 - uz**2)
-        ux_new = sin_theta * (ux * uz * cos_phi - uy * sin_phi) / denom + ux * cos_theta
-        uy_new = sin_theta * (uy * uz * cos_phi + ux * sin_phi) / denom + uy * cos_theta
-        uz_new = -sin_theta * cos_phi * denom + uz * cos_theta
+    u_new = cos_theta * u + sin_theta * par_r
+    u_new = u_new / u_new.norm(dim=-1, keepdim=True)
 
-    # Normalise to guard against floating-point drift
-    norm = math.sqrt(ux_new**2 + uy_new**2 + uz_new**2)
-    return ux_new / norm, uy_new / norm, uz_new / norm
+    par_new = cos_theta * par_r - sin_theta * u
+    par_new = par_new / par_new.norm(dim=-1, keepdim=True)
+
+    perp_new = perp_new / perp_new.norm(dim=-1, keepdim=True)
+
+    return u_new, par_new, perp_new
+
+
+def _rotate_stokes_batch(stokes: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+    """Batched rotation of a Stokes vector's reference frame by azimuth ``phi``."""
+    cos_2phi = torch.cos(2.0 * phi)
+    sin_2phi = torch.sin(2.0 * phi)
+    i, q, u, v = stokes.unbind(-1)
+    return torch.stack([i, cos_2phi * q + sin_2phi * u, -sin_2phi * q + cos_2phi * u, v], dim=-1)

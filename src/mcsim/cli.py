@@ -16,12 +16,30 @@ def main() -> None:
     parser.add_argument("--g", type=float, default=0.9, help="Anisotropy factor")
     parser.add_argument("--n", type=float, default=1.4, help="Refractive index of tissue")
     parser.add_argument("--depth", type=float, default=10.0, help="Slab thickness (mm)")
+    parser.add_argument("--sphere-diameter", type=float, default=1.0, help="Mie scatterer diameter (um)")
+    parser.add_argument("--sphere-index", type=float, default=1.46, help="Mie scatterer refractive index")
+    parser.add_argument("--wavelength", type=float, default=0.633, help="Illumination wavelength (um)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--plot", action="store_true", help="Show absorbed-energy depth profile")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="torch device to run on (default: GPU if available, else CPU)",
+    )
+    parser.add_argument("--plot", action="store_true", help="Show absorbed-energy and polarization plots")
     args = parser.parse_args()
 
-    layer = TissueLayer(mu_a=args.mu_a, mu_s=args.mu_s, g=args.g, n=args.n, depth=args.depth)
-    sim = Simulation(layer, seed=args.seed)
+    layer = TissueLayer(
+        mu_a=args.mu_a,
+        mu_s=args.mu_s,
+        g=args.g,
+        n=args.n,
+        depth=args.depth,
+        sphere_diameter=args.sphere_diameter,
+        sphere_index=args.sphere_index,
+        wavelength=args.wavelength,
+    )
+    sim = Simulation(layer, seed=args.seed, device=args.device)
+    print(f"Device           : {sim.device}")
     result = sim.run(args.n_photons)
 
     print(f"Photons          : {result.n_photons:,}")
@@ -38,7 +56,6 @@ def main() -> None:
 
 def _plot(result) -> None:
     import matplotlib.pyplot as plt
-    import numpy as np
 
     z_centers = 0.5 * (result.z_bins[:-1] + result.z_bins[1:])
     dz = result.z_bins[1] - result.z_bins[0]
@@ -50,4 +67,15 @@ def _plot(result) -> None:
     ax.set_ylabel("Absorbed energy density (mm⁻¹)")
     ax.set_title("Depth-resolved absorbed energy")
     fig.tight_layout()
+
+    angle_centers = 0.5 * (result.exit_angle_bins[:-1] + result.exit_angle_bins[1:])
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
+    ax2.plot(angle_centers, result.dolp_profile, marker="o", ms=3)
+    ax2.set_xlabel("Exit angle from surface normal (deg)")
+    ax2.set_ylabel("Degree of linear polarization")
+    ax2.set_title("Exit polarization vs angle")
+    ax2.set_xlim(0, 90)
+    ax2.set_ylim(bottom=0)
+    fig2.tight_layout()
+
     plt.show()
