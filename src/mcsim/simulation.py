@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.random import Generator
+from tqdm import tqdm
 
 from .tissue import TissueLayer
 
@@ -78,7 +79,7 @@ class Simulation:
         total_a = 0.0      # absorbed weight accumulator
         abs_profile = np.zeros(self.n_bins)
 
-        for _ in range(n_photons):
+        for _ in tqdm(range(n_photons), desc="Photons", unit="photon"):
             dr, dt, da, prof = self._trace_photon(r_specular)
             total_r += dr
             total_t += dt
