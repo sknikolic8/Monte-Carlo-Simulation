@@ -20,6 +20,11 @@ def main() -> None:
     parser.add_argument("--sphere-index", type=float, default=1.46, help="Mie scatterer refractive index")
     parser.add_argument("--wavelength", type=float, default=0.633, help="Illumination wavelength (um)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="torch device to run on (default: GPU if available, else CPU)",
+    )
     parser.add_argument("--plot", action="store_true", help="Show absorbed-energy and polarization plots")
     args = parser.parse_args()
 
@@ -33,7 +38,8 @@ def main() -> None:
         sphere_index=args.sphere_index,
         wavelength=args.wavelength,
     )
-    sim = Simulation(layer, seed=args.seed)
+    sim = Simulation(layer, seed=args.seed, device=args.device)
+    print(f"Device           : {sim.device}")
     result = sim.run(args.n_photons)
 
     print(f"Photons          : {result.n_photons:,}")

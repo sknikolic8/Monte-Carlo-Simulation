@@ -19,7 +19,8 @@ layer = TissueLayer(
 
 # Unpolarised incident light: Stokes vector [I, Q, U, V] = [1, 0, 0, 0]
 sim = Simulation(layer, n_above=1.0, n_below=1.0, seed=42, initial_stokes=(1.0, 0.0, 0.0, 0.0))
-result = sim.run(n_photons=50_000)
+print(f"Device        : {sim.device}")
+result = sim.run(n_photons=500_000)
 
 print(f"Specular R    : {result.specular_r:.4f}")
 print(f"Diffuse R     : {result.reflectance:.4f}")
