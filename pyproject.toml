@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "photon_mc"
+version = "0.1.0"
+description = "Polarization-resolved Monte Carlo photon transport in a slab scattering/absorbing medium"
+readme = "CLAUDE.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5",
+    "matplotlib>=3.10",
+    "tqdm>=4.67",
+    "miepython>=3.2",
+    "numpy>=2.0",
+]
+
+[project.scripts]
+photon-mc = "photon_mc.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/photon_mc"]
