@@ -45,13 +45,23 @@ INITIAL_STOKES = (1.0, 1.0, 0.0, 0.0)    # (I, Q, U, V) at launch; (1,0,0,0)=unp
                                           # (1,1,0,0)/(1,-1,0,0)=horiz/vert linear,
                                           # (1,0,1,0)=+45deg linear, (1,0,0,1)=right circular
 
-# If True, the scattering angle (theta, phi) is drawn via acceptance-rejection
-# against the TRUE polarization-dependent scattered intensity for the
-# photon's current Stokes vector, instead of sample_cos_theta()'s unpolarized
-# S11-only phase function + a phi uniform in [0, 2pi). Uses whichever Mueller
-# matrix MonteCarlo.mueller_matrix() would use anyway (Mie's exact one, or
-# the Rayleigh fallback for HG/isotropic). See MonteCarlo._sample_scattering_angle_polarized.
+# If True, the scattering angle (theta, phi) is drawn from the TRUE
+# polarization-dependent scattered intensity for the photon's current Stokes
+# vector, instead of sample_cos_theta()'s unpolarized S11-only phase function
+# + a phi uniform in [0, 2pi). Uses whichever Mueller matrix
+# MonteCarlo.mueller_matrix() would use anyway (Mie's exact one, or the
+# Rayleigh fallback for HG/isotropic). See MonteCarlo._sample_scattering_angle_polarized.
 USE_POLARIZED_SAMPLING = True
+
+# HEALPix grid used by _sample_scattering_angle_polarized to discretize the
+# polarization-dependent scattered intensity: a sharply forward-peaked phase
+# function (e.g. large-particle Mie) needs a finer grid to resolve the
+# forward lobe. npix = 12 * HEALPIX_NSIDE**2.
+HEALPIX_NSIDE = 16
+# Photons are processed HEALPIX_CHUNK_SIZE at a time when building the
+# per-photon (chunk, npix) weight/CDF matrix, so peak memory stays bounded
+# regardless of N_PHOTONS or HEALPIX_NSIDE.
+HEALPIX_CHUNK_SIZE = 100_000
 
 # ----- transport / roulette --------------------------------------------------
 

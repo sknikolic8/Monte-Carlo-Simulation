@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import math
 
+import jax.numpy as jnp
+import jax_healpy as jhp
+import numpy as np
 import torch
 from tqdm import tqdm
 
 from .medium import Medium
 from .params import (
-    DEVICE, DTYPE, INITIAL_STOKES, MAX_STEPS, RNG_SEED, SURVIVAL_CHANCE, USE_POLARIZED_SAMPLING, WEIGHT_THRESHOLD,
+    DEVICE, DTYPE, HEALPIX_CHUNK_SIZE, HEALPIX_NSIDE, INITIAL_STOKES, MAX_STEPS, RNG_SEED, SURVIVAL_CHANCE,
+    USE_POLARIZED_SAMPLING, WEIGHT_THRESHOLD,
 )
 from .phase_functions.mueller import fresnel_mueller_matrices, rayleigh_mueller_matrix, rotate_stokes
 
@@ -47,9 +51,40 @@ class MonteCarlo:
         if seed is not None:
             self.rng.manual_seed(seed)
 
+        if USE_POLARIZED_SAMPLING:
+            self._build_healpix_grid(HEALPIX_NSIDE)
+            self._healpix_chunk_size = HEALPIX_CHUNK_SIZE
+
     def _rand(self, n: int) -> torch.Tensor:
         # Clamp away from 0 so log(xi) in sample_step never hits -inf.
         return torch.rand(n, generator=self.rng, device=self.device, dtype=DTYPE).clamp_(1e-7, 1.0)
+
+    def _build_healpix_grid(self, nside: int) -> None:
+        """Precompute a fixed HEALPix grid of (cos_theta, phi) directions in
+        the local (direction, pol_ref) frame -- the pole is `direction` and
+        phi=0 is `pol_ref`, matching the phase function's own angle
+        convention -- used by _sample_scattering_angle_polarized to
+        discretize the polarization-dependent scattered intensity. Built
+        once with jax_healpy (pix2ang) and immediately converted to plain
+        torch tensors: jax's GPU backend has no native Windows build, but
+        this grid is only computed once at construction, so it costs nothing
+        to build on CPU regardless -- the actual per-step sampling below is
+        pure torch on `self.device`, matching the rest of the simulation.
+        """
+        npix = 12 * nside * nside
+        theta_pix, phi_pix = jhp.pix2ang(nside, jnp.arange(npix))
+        theta_pix = torch.as_tensor(np.asarray(theta_pix), device=self.device, dtype=DTYPE)
+        phi_pix = torch.as_tensor(np.asarray(phi_pix), device=self.device, dtype=DTYPE)
+
+        cos_theta_pix = torch.cos(theta_pix)
+        mueller_pix = self.mueller_matrix(cos_theta_pix)  # (npix, 4, 4)
+
+        self._pix_cos_theta = cos_theta_pix
+        self._pix_phi = phi_pix
+        self._pix_m11 = mueller_pix[:, 0, 0]
+        self._pix_m12 = mueller_pix[:, 0, 1]
+        self._pix_cos2phi = torch.cos(2.0 * phi_pix)
+        self._pix_sin2phi = torch.sin(2.0 * phi_pix)
 
     # ----- CDF inversion samplers (batched) ----------------------------------
 
@@ -93,57 +128,44 @@ class MonteCarlo:
         shrink = torch.clamp(1.0 / pol_mag, max=1.0)
         return torch.cat([stokes[:, :1], stokes[:, 1:] * shrink], dim=-1)
 
-    def _sample_scattering_angle_polarized(self, n: int, stokes: torch.Tensor, alive: torch.Tensor,
-                                            max_rounds: int = 50) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample (cos_theta, phi) via acceptance-rejection on the true
-        scattered intensity for the photon's current polarization state,
-        instead of sample_cos_theta()'s unpolarized phase function plus a
-        phi uniform in [0, 2pi).
+    def _sample_scattering_angle_polarized(self, n: int, stokes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample (cos_theta, phi) from the true scattered intensity for the
+        photon's current polarization state, instead of sample_cos_theta()'s
+        unpolarized phase function plus a phi uniform in [0, 2pi).
 
-        For fixed theta, the actual scattered intensity as a function of phi
-        is I(theta,phi) = M11(theta) + M12(theta)*(cos(2phi)*Q + sin(2phi)*U)
-        (the photon's Stokes vector is kept normalized to I=1, see run()).
-        Candidates (theta, phi) are drawn from the same unpolarized proposal
-        sample_cos_theta()/sample_azimuth() used when this is disabled, and
-        accepted with probability I(theta,phi) / [M11(theta) + |M12(theta)|*p],
-        where p = sqrt(Q^2+U^2) is the photon's current linear-polarization
-        magnitude -- the exact (tightest possible) envelope over phi, so
-        unpolarized photons (p=0) always accept on the first try and recover
-        the same unpolarized sampling as when this is disabled.
+        The true scattered intensity is I(theta,phi) = M11(theta) +
+        M12(theta)*(cos(2phi)*Q + sin(2phi)*U) (the photon's Stokes vector is
+        kept normalized to I=1, see run()) -- azimuthally asymmetric whenever
+        Q or U is nonzero, so phi can't be sampled independently of the
+        photon's own polarization state.
 
-        Any photon still unresolved after `max_rounds` (only possible for
-        strongly polarized light at sharply dichroic angles) is forced to
-        accept its last candidate, trading a small bias for a bounded loop.
+        Discretizes the sphere onto the fixed HEALPix grid from
+        _build_healpix_grid (shared by every photon, since it's defined in
+        each photon's own local (direction, pol_ref) frame) and draws one
+        pixel per photon by inverting that photon's own discrete CDF over
+        pixel weights -- exact for any polarization state, at the angular
+        resolution set by HEALPIX_NSIDE. Processed HEALPIX_CHUNK_SIZE photons
+        at a time so the (chunk, npix) weight/CDF matrix stays a fixed size
+        regardless of the total batch size n.
         """
-        cos_t = torch.zeros(n, device=self.device, dtype=DTYPE)
-        phi = torch.zeros(n, device=self.device, dtype=DTYPE)
-        pending = alive.clone()
-
+        cos_t = torch.empty(n, device=self.device, dtype=DTYPE)
+        phi = torch.empty(n, device=self.device, dtype=DTYPE)
         q_in, u_in = stokes[:, 1], stokes[:, 2]
-        p_in = torch.sqrt(q_in * q_in + u_in * u_in)
 
-        for _ in range(max_rounds):
-            if not pending.any():
-                break
+        chunk = self._healpix_chunk_size
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            weights = (self._pix_m11 + self._pix_m12 * (
+                q_in[start:end].unsqueeze(-1) * self._pix_cos2phi + u_in[start:end].unsqueeze(-1) * self._pix_sin2phi
+            )).clamp_min(0.0)
 
-            cand_cos_t = self.sample_cos_theta(n)
-            cand_phi = self.sample_azimuth(n)
+            cdf = torch.cumsum(weights, dim=-1)
+            cdf = cdf / cdf[:, -1:].clamp_min(1e-12)
+            xi = self._rand(end - start).unsqueeze(-1)
+            pix = torch.searchsorted(cdf, xi).squeeze(-1).clamp(max=cdf.shape[-1] - 1)
 
-            m = self.mueller_matrix(cand_cos_t)
-            m11, m12 = m[:, 0, 0], m[:, 0, 1]
-            cos2p, sin2p = torch.cos(2.0 * cand_phi), torch.sin(2.0 * cand_phi)
-            intensity = m11 + m12 * (cos2p * q_in + sin2p * u_in)
-            bound = m11 + m12.abs() * p_in
-            accept_prob = (intensity / bound.clamp_min(1e-12)).clamp(0.0, 1.0)
-            accept = pending & (self._rand(n) < accept_prob)
-
-            cos_t = torch.where(accept, cand_cos_t, cos_t)
-            phi = torch.where(accept, cand_phi, phi)
-            pending &= ~accept
-
-        if pending.any():
-            cos_t = torch.where(pending, cand_cos_t, cos_t)
-            phi = torch.where(pending, cand_phi, phi)
+            cos_t[start:end] = self._pix_cos_theta[pix]
+            phi[start:end] = self._pix_phi[pix]
 
         return cos_t, phi
 
@@ -287,7 +309,7 @@ class MonteCarlo:
                 # ----- phase-function scatter, using the carried (direction, --------
                 # pol_ref) frame so the polarization reference stays continuous -----
                 if USE_POLARIZED_SAMPLING:
-                    cos_t, phi = self._sample_scattering_angle_polarized(n, stokes, scatter_mask)
+                    cos_t, phi = self._sample_scattering_angle_polarized(n, stokes)
                 else:
                     cos_t = self.sample_cos_theta(n)
                     phi = self.sample_azimuth(n)
